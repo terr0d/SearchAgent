@@ -18,7 +18,7 @@ class AgentState(TypedDict):
     needs_clarification: Optional[bool]
 
 
-llm = ChatOllama(model="qwen3:30b-a3b", temperature=0.3)
+llm = ChatOllama(model="qwen3:8b", temperature=0.3)
 
 
 def _strip_think(text: str) -> str:
@@ -51,18 +51,42 @@ async def _fetch_single(session: aiohttp.ClientSession, url: str) -> tuple[str, 
 async def format_search_query(state: AgentState) -> AgentState:
     query = state["query"].strip()
     if not query:
-        return {**state, "needs_clarification": True, "error": "Запрос пустой."}
-    prompt = f"""/no_think
-                Ты – поисковой оптимизатор. 
-                Задача: превратить вопрос пользователя в ОДНУ короткую поисковую фразу (3-8 слов), убрав лишние стоп-слова.
-                Отвечай всегда на русском, без кавычек.
+        return {**state, "needs_clarification": True}
 
-                Вопрос: {query}
-                Выведи только поисковый запрос:"""
+    prompt = f"""/no_think
+                Ты – эксперт по поисковым запросам.
+                Если приведённый текст является понятным вопросом, преобразуй его в одну поисковую фразу (3-8 слов) без стоп-слов.
+                Если это не вопрос или он непонятен, ответь строго: NEEDS_CLARIFICATION.
+                Отвечай без кавычек.
+
+                Ввод: {query}
+
+                Ответ:"""
     response = await llm.ainvoke(prompt)
-    search_query = _strip_think(response.content).strip()
-    print(f"[DEBUG] Сформированный запрос:{search_query}\n")
-    return {**state, "query": search_query}
+    answer = _strip_think(response.content).strip()
+
+    if answer.upper() == "NEEDS_CLARIFICATION":
+        return {**state, "needs_clarification": True}
+
+    print(f"[DEBUG] Сформированный запрос: {answer}\n")
+    return {**state, "query": answer, "needs_clarification": False}
+
+
+async def clarify_question(state: AgentState) -> AgentState:
+    new_query = await asyncio.to_thread(
+        input, "Запрос непонятен. Пожалуйста, уточните формулировку: "
+    )
+    new_query = new_query.strip()
+    return {
+        **state,
+        "query": new_query,
+        "needs_clarification": False,
+        "error": None,
+        "search_results": None,
+        "page_contents": None,
+        "page_summaries": None,
+        "final_summary": None,
+    }
 
 
 async def search_duckduckgo(state: AgentState) -> AgentState:
@@ -121,7 +145,7 @@ async def create_final_summary(state: AgentState) -> AgentState:
     original_query = state["query"]
     joined = "\n\n".join(f"Источник: {u}\n{s}" for u, s in page_summaries.items())
     prompt = f"""/no_think
-                Ты – помощник, который собирает сводный ответ из нескольких источников.
+                Ты – помощник, который собирает общее саммари из нескольких источников.
                 В конце сделай раздел "Источники" в формате [N] URL, а в тексте – ссылки на них.
                 Если мнения расходятся – отрази все точки зрения.
                 Не добавляй личных рассуждений.
@@ -140,12 +164,9 @@ async def create_final_summary(state: AgentState) -> AgentState:
         async for chunk in llm.astream(prompt):
             token = _strip_think(chunk.content)
 
-            if not started:
-                if token.strip() == "":
-                    continue
-                started = True
-                token = token.lstrip()
-
+            if not started and token.strip() == "":
+                continue
+            started = True
             print(token, end="", flush=True)
             final_parts.append(token)
 
@@ -174,26 +195,43 @@ def should_continue(state: AgentState) -> str:
 def build_agent_graph():
     g = StateGraph(AgentState)
     g.add_node("format_query", format_search_query)
+    g.add_node("clarify", clarify_question)
     g.add_node("search", search_duckduckgo)
     g.add_node("extract", extract_page_content)
     g.add_node("summarize_pages", summarize_pages)
     g.add_node("create_final_summary", create_final_summary)
+
     g.set_entry_point("format_query")
-    g.add_conditional_edges("format_query", should_continue, {"clarify": END, "search": "search", "error": END})
-    g.add_conditional_edges("search", should_continue, {"extract": "extract", "error": END})
-    g.add_conditional_edges("extract", should_continue, {"summarize_pages": "summarize_pages", "error": END})
-    g.add_conditional_edges("summarize_pages", should_continue, {"create_final_summary": "create_final_summary", "error": END})
-    g.add_conditional_edges("create_final_summary", should_continue, {"end": END, "error": END})
+
+    g.add_conditional_edges(
+        "format_query",
+        should_continue,
+        {"clarify": "clarify", "search": "search", "error": END},
+    )
+    g.add_edge("clarify", "format_query")
+
+    g.add_conditional_edges(
+        "search", should_continue, {"extract": "extract", "error": END}
+    )
+    g.add_conditional_edges(
+        "extract", should_continue, {"summarize_pages": "summarize_pages", "error": END}
+    )
+    g.add_conditional_edges(
+        "summarize_pages",
+        should_continue,
+        {"create_final_summary": "create_final_summary", "error": END},
+    )
+    g.add_conditional_edges(
+        "create_final_summary", should_continue, {"end": END, "error": END}
+    )
     return g.compile()
 
 
 async def run_agent(query: str):
     agent = build_agent_graph()
-    print(f"\nОбрабатываю запрос: {query}\nПодождите, идет поиск информации...\n")
+    print(f"\nОбрабатываю запрос: {query}\nПодождите, идёт поиск информации...\n")
     result: AgentState = await agent.ainvoke({"query": query})
-    if result.get("needs_clarification"):
-        print("Запрос неясен. Пожалуйста, уточните вопрос.")
-    elif result.get("error"):
+    if result.get("error") and not result.get("needs_clarification"):
         print(f"Произошла ошибка: {result['error']}")
 
 
@@ -203,13 +241,10 @@ async def main():
         return
     print("Введите ваш вопрос или 'q' для выхода.")
     while True:
-        query = input("\nВаш вопрос: ").strip()
-        if query.lower() == "q":
+        q = input("\nВаш вопрос: ").strip()
+        if q.lower() == "q":
             break
-        if not query:
-            print("Пожалуйста, введите вопрос.")
-            continue
-        await run_agent(query)
+        await run_agent(q)
 
 
 if __name__ == "__main__":
