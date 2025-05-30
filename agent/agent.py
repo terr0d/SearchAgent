@@ -32,9 +32,13 @@ async def _run_ddg(query: str, max_results: int = 5) -> List[Dict]:
     return await asyncio.to_thread(_search, query)
 
 
+def _jina_ai_url(url: str) -> str:
+    return "https://r.jina.ai/http://" + url.replace("https://", "").replace("http://", "")
+
+
 async def _fetch_single(session: aiohttp.ClientSession, url: str) -> tuple[str, str]:
     try:
-        async with session.get(url, timeout=15) as r:
+        async with session.get(url, timeout=8) as r:
             html = await r.text()
         text = trafilatura.extract(
             html,
@@ -114,27 +118,46 @@ async def summarize_pages(state: AgentState) -> AgentState:
     page_contents = state.get("page_contents") or {}
     original_query = state["query"]
     page_summaries: Dict[str, str] = {}
-    for url, content in page_contents.items():
-        if content.startswith(("Ошибка", "Не удалось")):
-            page_summaries[url] = content
-            continue
-        prompt = f"""/no_think
-                    Ты – аналитик, умеющий делать краткие саммари.
-                    Всегда отвечай на русском.
-                    Если текст нерелевантен вопросу, ответь: "Нерелевантный источник".
-                    Вопрос: {original_query}
+    async with aiohttp.ClientSession() as session:
+        for url, content in page_contents.items():
+            if content.startswith(("Ошибка", "Не удалось")):
+                page_summaries[url] = content
+                continue
+            prompt = f"""/no_think
+                        Ты – аналитик, умеющий делать краткие саммари.
+                        Всегда отвечай на русском.
+                        Если текст нерелевантен вопросу, ответь: "Нерелевантный источник".
+                        Вопрос: {original_query}
 
-                    Текст:
-                    {content}
+                        Текст:
+                        {content}
 
-                    Резюме:"""
-        try:
-            resp = await llm.ainvoke(prompt)
-            summary = _strip_think(resp.content).strip()
-            page_summaries[url] = summary
-            print(f"[DEBUG] Резюме {url}:\n{summary}\n")
-        except Exception as e:
-            page_summaries[url] = f"Ошибка при создании резюме: {e}"
+                        Резюме:"""
+            try:
+                resp = await llm.ainvoke(prompt)
+                summary = _strip_think(resp.content).strip()
+
+                if summary == "Нерелевантный источник.":
+                    jina_url = _jina_ai_url(url)
+                    async with session.get(jina_url, timeout=8) as jr:
+                        jina_text = await jr.text()
+                    jina_prompt = f"""/no_think
+                                   Ты – аналитик, умеющий делать краткие саммари.
+                                   Всегда отвечай на русском.
+                                   Если текст нерелевантен вопросу, ответь: "Нерелевантный источник".
+                                   Вопрос: {original_query}
+
+                                   Текст:
+                                   {jina_text}
+
+                                   Резюме:"""
+                    resp = await llm.ainvoke(jina_prompt)
+                    summary = _strip_think(resp.content).strip()
+
+                page_summaries[url] = summary
+                print(f"[DEBUG] Резюме {url}:\n{summary}\n")
+            except Exception as e:
+                page_summaries[url] = f"Ошибка при создании резюме: {e}"
     return {**state, "page_summaries": page_summaries}
 
 
@@ -148,6 +171,7 @@ async def create_final_summary(state: AgentState) -> AgentState:
                 Ты – помощник, который собирает общее саммари из нескольких источников.
                 В конце сделай раздел "Источники" в формате [N] URL, а в тексте – ссылки на них.
                 Если мнения расходятся – отрази все точки зрения.
+                Если не удалось получить релевантную информацию из источника, не упоминай его в ответе.
                 Не добавляй личных рассуждений.
                 
                 Вопрос: {original_query}
@@ -221,9 +245,7 @@ def build_agent_graph():
         should_continue,
         {"create_final_summary": "create_final_summary", "error": END},
     )
-    g.add_conditional_edges(
-        "create_final_summary", should_continue, {"end": END, "error": END}
-    )
+    g.add_edge("create_final_summary", END)
     return g.compile()
 
 
