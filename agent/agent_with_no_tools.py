@@ -137,7 +137,7 @@ async def summarize_pages(state: AgentState) -> AgentState:
                 resp = await llm.ainvoke(prompt)
                 summary = _strip_think(resp.content).strip()
 
-                if summary == "Нерелевантный источник.":
+                if "нерелевантный источник" in summary.lower():
                     jina_url = _jina_ai_url(url)
                     async with session.get(jina_url, timeout=8) as jr:
                         jina_text = await jr.text()
